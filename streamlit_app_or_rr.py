@@ -2,9 +2,10 @@
 Stream-lite — Odds Ratio / Relative Risk Builder
 ==================================================
 A Streamlit app that turns an uploaded master chart (Excel/CSV) into a
-publication-ready univariate OR / RR table: pick an outcome, pick one or
-more factors, choose baseline (reference) categories, and get odds ratios
-and/or relative risks with 95% CI and p-values.
+publication-ready univariate OR / RR table, split by outcome group:
+continuous factors get descriptive statistics per outcome group, categorical
+factors get n (%) per outcome group, and every factor gets a univariate
+odds ratio and/or relative risk (95% CI) with a p-value.
 
 Run with:
     pip install streamlit pandas numpy scipy statsmodels openpyxl python-docx
@@ -15,31 +16,36 @@ How the analysis works
 Outcome    -> pick a column, then pick which category is the "baseline"
               (reference / non-event) and which is the "event". If the
               column has more than two categories, rows with any other
-              value are excluded from the analysis.
+              value are excluded from the analysis. The table has one
+              column per outcome group (baseline, event).
 
-Categorical factors -> for each factor, pick a baseline (reference)
-              category. Every other category is compared pairwise against
-              that reference using a 2x2 table (rows belonging to a third
-              category of the same factor are excluded from that specific
-              comparison, same logic as the outcome). From the 2x2 table:
+Continuous (numeric) factors -> reported per outcome group as mean \u00B1 SD,
+              median (IQR), or both — your choice, with a decimal-places
+              control. "Auto" picks mean \u00B1 SD when both outcome groups
+              pass a D'Agostino-Pearson normality test, median (IQR)
+              otherwise.
+                OR = exp(beta) from univariate logistic regression
+                RR = exp(beta) from log-binomial regression, falling back
+                     to modified Poisson regression with robust (HC1)
+                     standard errors if log-binomial fails to converge.
+              Effect size is reported per 1 unit or per 1 SD increase,
+              your choice.
+
+Categorical factors -> reported as n (%) per outcome group (% of that
+              group's non-missing total for the variable). Pick a baseline
+              (reference) category; every other category is compared
+              pairwise against it using a 2x2 table:
                 OR = (a*d) / (b*c)              [Woolf logit 95% CI]
                 RR = risk(exposed) / risk(ref)   [log-method 95% CI]
                 p  = chi-square test of independence, automatically
                      switched to Fisher's exact test when an expected
                      cell count is below 5.
               A 2x2 table with a zero cell gets the Haldane-Anscombe
-              correction (+0.5 to all four cells) so OR/RR/CI can still
-              be computed; this is flagged in the footnotes.
+              correction (+0.5 to all four cells) so OR/RR/CI can still be
+              computed; this is flagged in the footnotes.
 
-Numeric factors -> analyzed continuously (no baseline needed):
-                OR = exp(beta) from univariate logistic regression
-                RR = exp(beta) from log-binomial regression, falling back
-                     to modified Poisson regression with robust (HC1)
-                     standard errors if the log-binomial model fails to
-                     converge (a standard workaround for that model's
-                     frequent convergence problems).
-              Effect size is reported either per 1 unit or per 1 SD
-              increase, your choice.
+OR/RR values and descriptive statistics each have their own independent
+decimal-places control in the settings panel.
 """
 
 import io
@@ -87,14 +93,60 @@ def effective_type(meta):
     return meta["detected"] if meta["type"] == "auto" else meta["type"]
 
 
+def is_normal(arr, alpha=0.05):
+    """D'Agostino-Pearson omnibus normality test. Needs n>=8; smaller
+    samples are treated as non-normal (safer default)."""
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if len(arr) < 8:
+        return False
+    if np.all(arr == arr[0]):
+        return True
+    try:
+        _, p = stats.normaltest(arr)
+        return p > alpha
+    except Exception:
+        return False
+
+
 def fmt_p(p):
     if p is None or (isinstance(p, float) and np.isnan(p)):
         return "—"
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
-def fmt_ratio(val, low, high):
-    return f"{val:.2f} ({low:.2f}\u2013{high:.2f})"
+def fmt_num(x, d=3):
+    return f"{x:.{d}f}"
+
+
+def fmt_ratio(val, low, high, decimals=2):
+    return f"{val:.{decimals}f} ({low:.{decimals}f}\u2013{high:.{decimals}f})"
+
+
+def format_numeric_cell(values, display_mode, use_param, decimals):
+    """Format one outcome group's numeric summary. display_mode:
+    'auto' | 'mean_sd' | 'median_iqr' | 'both'"""
+    if len(values) == 0:
+        return "—"
+    show_mean = display_mode == "mean_sd" or display_mode == "both" or (display_mode == "auto" and use_param)
+    show_median = display_mode == "median_iqr" or display_mode == "both" or (display_mode == "auto" and not use_param)
+    parts = []
+    if show_mean:
+        parts.append(f"{fmt_num(np.mean(values), decimals)} \u00B1 {fmt_num(np.std(values, ddof=1), decimals)}")
+    if show_median:
+        q1, med, q3 = np.percentile(values, [25, 50, 75])
+        parts.append(f"{fmt_num(med, decimals)} ({fmt_num(q1, decimals)}\u2013{fmt_num(q3, decimals)})")
+    return "; ".join(parts)
+
+
+def numeric_label(col, display_mode, use_param):
+    if display_mode == "mean_sd":
+        return f"{col}, mean \u00B1 SD"
+    if display_mode == "median_iqr":
+        return f"{col}, median (IQR)"
+    if display_mode == "both":
+        return f"{col}, mean \u00B1 SD; median (IQR)"
+    return f"{col}, mean \u00B1 SD" if use_param else f"{col}, median (IQR)"
 
 
 # --------------------------------------------------------------------------
@@ -199,17 +251,20 @@ def poisson_rr(x, y, alpha, standardize=False):
 # Table builder
 # --------------------------------------------------------------------------
 
-def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_cols,
-                       factor_types, ref_map, alpha, compute_or, compute_rr,
-                       numeric_effect, pct_digits, yates_correction):
+def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_cols,
+                       factor_types, ref_map, alpha, compute_or, compute_rr, numeric_effect,
+                       display_mode, desc_decimals, or_decimals, pct_digits, yates_correction):
     outcome_raw = df[outcome_col].astype(str).str.strip()
     in_scope = outcome_raw.isin([baseline_outcome, event_outcome])
     y_full = pd.Series(np.nan, index=df.index)
     y_full[in_scope & (outcome_raw == event_outcome)] = 1.0
     y_full[in_scope & (outcome_raw == baseline_outcome)] = 0.0
 
+    n_baseline_all = int((y_full == 0).sum())
+    n_event_all = int((y_full == 1).sum())
+
     ci_pct = int(round((1 - alpha) * 100))
-    header = ["Variable", "n", f"{event_outcome} n (%)"]
+    header = ["Variable", f"{baseline_outcome} (n={n_baseline_all})", f"{event_outcome} (n={n_event_all})"]
     if compute_or:
         header.append(f"OR ({ci_pct}% CI)")
     if compute_rr:
@@ -231,15 +286,18 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             if ref not in levels:
                 continue
 
-            display_rows.append({"kind": "varheader", "label": f"{col} (ref: {ref})"})
-            csv_rows.append([f"{col} (ref: {ref})"])
+            base_total_var = int(((series.notna()) & (y_full == 0)).sum())
+            event_total_var = int(((series.notna()) & (y_full == 1)).sum())
+
+            display_rows.append({"kind": "varheader", "label": f"{col}, n (%) (ref: {ref})"})
+            csv_rows.append([f"{col}, n (%) (ref: {ref})"])
 
             ref_mask = (series == ref)
             c = int((ref_mask & (y_full == 1)).sum())
             d = int((ref_mask & (y_full == 0)).sum())
-            n_ref = c + d
-            pct_ref = 100 * c / n_ref if n_ref else 0.0
-            ref_cells = [n_ref, f"{c} ({pct_ref:.{pct_digits}f}%)"]
+            pct_d = 100 * d / base_total_var if base_total_var else 0.0
+            pct_c = 100 * c / event_total_var if event_total_var else 0.0
+            ref_cells = [f"{d} ({pct_d:.{pct_digits}f}%)", f"{c} ({pct_c:.{pct_digits}f}%)"]
             if compute_or:
                 ref_cells.append("1.00 (Reference)")
             if compute_rr:
@@ -254,11 +312,11 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                 lv_mask = (series == lv)
                 a = int((lv_mask & (y_full == 1)).sum())
                 b = int((lv_mask & (y_full == 0)).sum())
-                n_lv = a + b
-                pct_lv = 100 * a / n_lv if n_lv else 0.0
-                cells = [n_lv, f"{a} ({pct_lv:.{pct_digits}f}%)"]
+                pct_b = 100 * b / base_total_var if base_total_var else 0.0
+                pct_a = 100 * a / event_total_var if event_total_var else 0.0
+                cells = [f"{b} ({pct_b:.{pct_digits}f}%)", f"{a} ({pct_a:.{pct_digits}f}%)"]
                 p_val = None
-                if n_lv == 0 or n_ref == 0:
+                if (a + b) == 0 or (c + d) == 0:
                     if compute_or:
                         cells.append("—")
                     if compute_rr:
@@ -278,27 +336,37 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                         r = odds_ratio_ci(a, b, c, d, alpha)
                         if r["corrected"]:
                             flags.add("haldane")
-                        cells.append(fmt_ratio(r["val"], r["low"], r["high"]))
+                        cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
                     if compute_rr:
                         r = relative_risk_ci(a, b, c, d, alpha)
                         if r["corrected"]:
                             flags.add("haldane")
-                        cells.append(fmt_ratio(r["val"], r["low"], r["high"]))
+                        cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
                     cells.append(fmt_p(p_val))
                 sig = p_val is not None and p_val < alpha
                 display_rows.append({"kind": "level", "label": lv, "cells": cells, "sig": sig})
                 csv_rows.append([f"  {lv}", *cells])
 
         else:  # numerical
-            x = pd.to_numeric(df[col], errors="coerce")
-            mask = x.notna() & y_full.notna()
-            xv = x[mask].values
+            numeric_series = pd.to_numeric(df[col], errors="coerce")
+            baseline_vals = numeric_series[(y_full == 0) & numeric_series.notna()].values
+            event_vals = numeric_series[(y_full == 1) & numeric_series.notna()].values
+
+            if display_mode == "auto":
+                use_param = is_normal(baseline_vals, alpha) and is_normal(event_vals, alpha)
+            else:
+                use_param = display_mode == "mean_sd"
+
+            label = numeric_label(col, display_mode, use_param)
+            cell_baseline = format_numeric_cell(baseline_vals, display_mode, use_param, desc_decimals)
+            cell_event = format_numeric_cell(event_vals, display_mode, use_param, desc_decimals)
+            cells = [cell_baseline, cell_event]
+
+            mask = numeric_series.notna() & y_full.notna()
+            xv = numeric_series[mask].values
             yv = y_full[mask].values
             n = len(xv)
-            eff_label = "per 1 SD increase" if numeric_effect == "sd" else "per 1 unit increase"
-            label = f"{col}, {eff_label}"
 
-            cells = [n, "—"]
             p_val = None
             if n < 8 or len(np.unique(yv)) < 2:
                 if compute_or:
@@ -314,7 +382,7 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                         cells.append("—")
                         flags.add("skipped")
                     else:
-                        cells.append(fmt_ratio(lg["val"], lg["low"], lg["high"]))
+                        cells.append(fmt_ratio(lg["val"], lg["low"], lg["high"], or_decimals))
                         p_val = lg["p"]
                 if compute_rr:
                     ps = poisson_rr(xv, yv, alpha, standardize=(numeric_effect == "sd"))
@@ -322,7 +390,7 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                         cells.append("—")
                         flags.add("skipped")
                     else:
-                        cells.append(fmt_ratio(ps["val"], ps["low"], ps["high"]))
+                        cells.append(fmt_ratio(ps["val"], ps["low"], ps["high"], or_decimals))
                         if p_val is None:
                             p_val = ps["p"]
                         if ps.get("method") == "modified Poisson (robust SE)":
@@ -335,20 +403,32 @@ def build_or_rr_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
     return header, display_rows, csv_rows, flags
 
 
-def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome,
-                     n_excluded, yates_correction, compute_or, compute_rr):
+def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, n_excluded,
+                     yates_correction, compute_or, compute_rr, display_mode, desc_decimals,
+                     or_decimals, numeric_effect, pct_digits):
     ci_pct = int(round((1 - alpha) * 100))
     notes = []
+
+    desc_txt = {"mean_sd": "mean \u00B1 SD", "median_iqr": "median (IQR)",
+                "both": "mean \u00B1 SD and median (IQR)",
+                "auto": f"mean \u00B1 SD (assessed as normal via D'Agostino-Pearson test, \u03B1={alpha}) "
+                        "or median (IQR) otherwise"}[display_mode]
+    notes.append(f"Continuous variables reported as {desc_txt}, to {desc_decimals} decimal place(s), per "
+                  f"outcome group; categorical variables reported as n (%) of that group's non-missing "
+                  f"total (missing values excluded from the denominator), to {pct_digits} decimal "
+                  f"place(s).")
+
     parts = []
     if compute_or:
         parts.append("OR = odds ratio")
     if compute_rr:
         parts.append("RR = relative risk (risk ratio)")
-    notes.append("; ".join(parts) + f"; CI = confidence interval ({ci_pct}%).")
+    notes.append("; ".join(parts) + f"; CI = confidence interval ({ci_pct}%), shown to {or_decimals} "
+                  f"decimal place(s).")
 
     notes.append(
-        f"Outcome variable: {outcome_col}. Baseline (reference) category: {baseline_outcome}. "
-        f"Event category: {event_outcome}."
+        f"Outcome variable: {outcome_col}. Baseline (reference) group: {baseline_outcome}. "
+        f"Event group: {event_outcome}."
         + (f" {n_excluded} row(s) with another {outcome_col} value were excluded from the analysis."
            if n_excluded > 0 else "")
     )
@@ -368,17 +448,17 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome,
         notes.append("Caution: one or more chi-square comparisons above have expected cell counts below "
                       "5; the chi-square approximation may be unreliable there.")
 
-    num_note = "Numeric factors: "
     num_parts = []
+    eff_txt = "per 1 SD increase" if numeric_effect == "sd" else "per 1 unit increase"
     if compute_or:
-        num_parts.append(f"OR from univariate logistic regression (Wald {ci_pct}% CI)")
+        num_parts.append(f"OR ({eff_txt}) from univariate logistic regression (Wald {ci_pct}% CI)")
     if compute_rr:
-        num_parts.append("RR from log-binomial regression, falling back to modified Poisson regression "
-                          "with robust (HC1) standard errors when log-binomial failed to converge"
-                          if "modpoisson" in flags else
-                          "RR from log-binomial regression")
+        rr_txt = f"RR ({eff_txt}) from log-binomial regression"
+        if "modpoisson" in flags:
+            rr_txt += ", falling back to modified Poisson regression with robust (HC1) standard errors when log-binomial failed to converge"
+        num_parts.append(rr_txt)
     if num_parts:
-        notes.append(num_note + "; ".join(num_parts) + ".")
+        notes.append("Numeric factors: " + "; ".join(num_parts) + ".")
 
     if "skipped" in flags:
         notes.append("A comparison could not be computed for one or more categories/variables (e.g. "
@@ -572,9 +652,9 @@ def build_docx(header, display_rows, alpha, footnotes, title="Odds Ratio / Relat
 st.title("Stream-lite · OR / RR Builder")
 st.caption(
     "Upload a master chart, pick an outcome and its baseline category, pick your factors and their "
-    "baseline categories, and Stream-lite computes univariate odds ratios and/or relative risks with "
-    "95% CI and p-values — categorical factors via 2\u00D72 tables (chi-square / Fisher's exact), "
-    "numeric factors via logistic / log-binomial regression."
+    "baseline categories, and Stream-lite builds a split table: continuous descriptive stats or "
+    "categorical n (%) per outcome group, plus univariate OR and/or RR (95% CI) and a p-value for "
+    "every factor."
 )
 
 if sm is None:
@@ -718,20 +798,31 @@ if uploaded is not None:
 
     # ---------------------------------------------------------------- 4. Settings
     st.markdown("### 4. Analysis settings")
-    s1, s2, s3, s4 = st.columns([1.3, 1.3, 1, 1])
+    s1, s2, s3, s4 = st.columns([1.4, 1.4, 1.1, 1.1])
     with s1:
+        st.markdown("**Effect measure**")
         compute_or = st.checkbox("Compute Odds Ratio (OR)", value=True)
         compute_rr = st.checkbox("Compute Relative Risk (RR)", value=True)
+        or_decimals = st.number_input("OR/RR decimal places", min_value=0, max_value=6, value=2, step=1)
     with s2:
+        st.markdown("**Continuous descriptive stats**")
+        display_mode = st.radio(
+            "Display as",
+            options=["auto", "mean_sd", "median_iqr", "both"],
+            format_func=lambda x: {"auto": "Auto (normality-based)", "mean_sd": "Mean \u00B1 SD",
+                                    "median_iqr": "Median (IQR)", "both": "Both"}[x],
+            label_visibility="collapsed",
+        )
+        desc_decimals = st.number_input("Descriptive stats decimal places", min_value=0, max_value=6, value=3, step=1)
+    with s3:
         numeric_effect = st.radio(
             "Numeric factor effect size",
             options=["unit", "sd"],
             format_func=lambda x: "Per 1 unit increase" if x == "unit" else "Per 1 SD increase",
         )
-    with s3:
         alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5, value=0.05, step=0.01)
-        pct_digits = st.number_input("% decimal places", min_value=0, max_value=4, value=1, step=1)
     with s4:
+        pct_digits = st.number_input("Categorical % decimal places", min_value=0, max_value=4, value=1, step=1)
         yates_correction = st.checkbox(
             "Apply Yates' continuity correction (2\u00D72 chi-square)", value=False,
             help="Only affects chi-square p-values on 2\u00D72 tables (ignored for Fisher's exact test). "
@@ -748,24 +839,28 @@ if uploaded is not None:
     if numeric_factors and sm is None:
         st.warning("Numeric factors are selected but `statsmodels` isn't installed — those rows will be skipped.")
 
-    if st.button("Generate OR / RR table", type="primary", disabled=not can_generate):
-        header, display_rows, csv_rows, flags = build_or_rr_table(
+    if st.button("Generate table", type="primary", disabled=not can_generate):
+        header, display_rows, csv_rows, flags = build_split_table(
             df, outcome_col, baseline_outcome, event_outcome, selected_factors, factor_types,
-            ref_map, alpha, compute_or, compute_rr, numeric_effect, pct_digits, yates_correction,
+            ref_map, alpha, compute_or, compute_rr, numeric_effect, display_mode, desc_decimals,
+            or_decimals, pct_digits, yates_correction,
         )
         st.session_state["or_rr_result"] = (header, display_rows, csv_rows, flags, alpha,
                                              outcome_col, baseline_outcome, event_outcome, n_excluded,
-                                             yates_correction, compute_or, compute_rr)
+                                             yates_correction, compute_or, compute_rr, display_mode,
+                                             desc_decimals, or_decimals, numeric_effect, pct_digits)
 
     if "or_rr_result" in st.session_state:
         (header, display_rows, csv_rows, flags, r_alpha, r_outcome_col, r_baseline, r_event,
-         r_n_excluded, r_yates, r_compute_or, r_compute_rr) = st.session_state["or_rr_result"]
+         r_n_excluded, r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
+         r_or_decimals, r_numeric_effect, r_pct_digits) = st.session_state["or_rr_result"]
 
-        st.markdown("### Table. Odds ratios / relative risks")
+        st.markdown("### Table. Baseline characteristics with univariate OR / RR")
         st.markdown(render_table_markdown(header, display_rows), unsafe_allow_html=True)
 
         footnotes = build_footnotes(r_alpha, flags, r_outcome_col, r_baseline, r_event, r_n_excluded,
-                                     r_yates, r_compute_or, r_compute_rr)
+                                     r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
+                                     r_or_decimals, r_numeric_effect, r_pct_digits)
         st.caption("  \n".join(footnotes))
 
         dl_col1, dl_col2, dl_col3 = st.columns(3)
