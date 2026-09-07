@@ -253,7 +253,8 @@ def poisson_rr(x, y, alpha, standardize=False):
 
 def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_cols,
                        factor_types, ref_map, alpha, compute_or, compute_rr, numeric_effect,
-                       display_mode, desc_decimals, or_decimals, pct_digits, yates_correction):
+                       display_mode, desc_decimals, or_decimals, pct_digits, yates_correction,
+                       pct_mode="column"):
     outcome_raw = df[outcome_col].astype(str).str.strip()
     in_scope = outcome_raw.isin([baseline_outcome, event_outcome])
     y_full = pd.Series(np.nan, index=df.index)
@@ -295,8 +296,13 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             ref_mask = (series == ref)
             c = int((ref_mask & (y_full == 1)).sum())
             d = int((ref_mask & (y_full == 0)).sum())
-            pct_d = 100 * d / base_total_var if base_total_var else 0.0
-            pct_c = 100 * c / event_total_var if event_total_var else 0.0
+            if pct_mode == "row":
+                row_total_ref = c + d
+                pct_d = 100 * d / row_total_ref if row_total_ref else 0.0
+                pct_c = 100 * c / row_total_ref if row_total_ref else 0.0
+            else:
+                pct_d = 100 * d / base_total_var if base_total_var else 0.0
+                pct_c = 100 * c / event_total_var if event_total_var else 0.0
             ref_cells = [f"{d} ({pct_d:.{pct_digits}f}%)", f"{c} ({pct_c:.{pct_digits}f}%)"]
             if compute_or:
                 ref_cells.append("1.00 (Reference)")
@@ -312,8 +318,13 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                 lv_mask = (series == lv)
                 a = int((lv_mask & (y_full == 1)).sum())
                 b = int((lv_mask & (y_full == 0)).sum())
-                pct_b = 100 * b / base_total_var if base_total_var else 0.0
-                pct_a = 100 * a / event_total_var if event_total_var else 0.0
+                if pct_mode == "row":
+                    row_total_lv = a + b
+                    pct_b = 100 * b / row_total_lv if row_total_lv else 0.0
+                    pct_a = 100 * a / row_total_lv if row_total_lv else 0.0
+                else:
+                    pct_b = 100 * b / base_total_var if base_total_var else 0.0
+                    pct_a = 100 * a / event_total_var if event_total_var else 0.0
                 cells = [f"{b} ({pct_b:.{pct_digits}f}%)", f"{a} ({pct_a:.{pct_digits}f}%)"]
                 p_val = None
                 if (a + b) == 0 or (c + d) == 0:
@@ -405,7 +416,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
 
 def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, n_excluded,
                      yates_correction, compute_or, compute_rr, display_mode, desc_decimals,
-                     or_decimals, numeric_effect, pct_digits):
+                     or_decimals, numeric_effect, pct_digits, pct_mode="column"):
     ci_pct = int(round((1 - alpha) * 100))
     notes = []
 
@@ -413,10 +424,15 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, 
                 "both": "mean \u00B1 SD and median (IQR)",
                 "auto": f"mean \u00B1 SD (assessed as normal via D'Agostino-Pearson test, \u03B1={alpha}) "
                         "or median (IQR) otherwise"}[display_mode]
+    if pct_mode == "row":
+        pct_basis = ("row-wise: each n (%) is a share of that category's total across both outcome "
+                     "groups (rows sum to ~100%)")
+    else:
+        pct_basis = ("column-wise: each n (%) is a share of its own outcome group's non-missing total "
+                     "for that variable (columns sum to ~100%)")
     notes.append(f"Continuous variables reported as {desc_txt}, to {desc_decimals} decimal place(s), per "
-                  f"outcome group; categorical variables reported as n (%) of that group's non-missing "
-                  f"total (missing values excluded from the denominator), to {pct_digits} decimal "
-                  f"place(s).")
+                  f"outcome group. Categorical variables reported as n (%), {pct_basis}, to {pct_digits} "
+                  f"decimal place(s) (missing values excluded from the denominator).")
 
     parts = []
     if compute_or:
@@ -822,6 +838,14 @@ if uploaded is not None:
         )
         alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5, value=0.05, step=0.01)
     with s4:
+        pct_mode = st.radio(
+            "Categorical % basis",
+            options=["column", "row"],
+            format_func=lambda x: "Column-wise (\u00F7 group n)" if x == "column" else "Row-wise (\u00F7 category n)",
+            help="Column-wise: each n (%) is a share of its own outcome group's total (columns sum to "
+                 "~100%). Row-wise: each n (%) is a share of that category's total across both outcome "
+                 "groups (rows sum to ~100%).",
+        )
         pct_digits = st.number_input("Categorical % decimal places", min_value=0, max_value=4, value=1, step=1)
         yates_correction = st.checkbox(
             "Apply Yates' continuity correction (2\u00D72 chi-square)", value=False,
@@ -843,24 +867,25 @@ if uploaded is not None:
         header, display_rows, csv_rows, flags = build_split_table(
             df, outcome_col, baseline_outcome, event_outcome, selected_factors, factor_types,
             ref_map, alpha, compute_or, compute_rr, numeric_effect, display_mode, desc_decimals,
-            or_decimals, pct_digits, yates_correction,
+            or_decimals, pct_digits, yates_correction, pct_mode,
         )
         st.session_state["or_rr_result"] = (header, display_rows, csv_rows, flags, alpha,
                                              outcome_col, baseline_outcome, event_outcome, n_excluded,
                                              yates_correction, compute_or, compute_rr, display_mode,
-                                             desc_decimals, or_decimals, numeric_effect, pct_digits)
+                                             desc_decimals, or_decimals, numeric_effect, pct_digits,
+                                             pct_mode)
 
     if "or_rr_result" in st.session_state:
         (header, display_rows, csv_rows, flags, r_alpha, r_outcome_col, r_baseline, r_event,
          r_n_excluded, r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
-         r_or_decimals, r_numeric_effect, r_pct_digits) = st.session_state["or_rr_result"]
+         r_or_decimals, r_numeric_effect, r_pct_digits, r_pct_mode) = st.session_state["or_rr_result"]
 
         st.markdown("### Table. Baseline characteristics with univariate OR / RR")
         st.markdown(render_table_markdown(header, display_rows), unsafe_allow_html=True)
 
         footnotes = build_footnotes(r_alpha, flags, r_outcome_col, r_baseline, r_event, r_n_excluded,
                                      r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
-                                     r_or_decimals, r_numeric_effect, r_pct_digits)
+                                     r_or_decimals, r_numeric_effect, r_pct_digits, r_pct_mode)
         st.caption("  \n".join(footnotes))
 
         dl_col1, dl_col2, dl_col3 = st.columns(3)
