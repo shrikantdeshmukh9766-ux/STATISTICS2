@@ -265,7 +265,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
     n_event_all = int((y_full == 1).sum())
 
     ci_pct = int(round((1 - alpha) * 100))
-    header = ["Variable", f"{baseline_outcome} (n={n_baseline_all})", f"{event_outcome} (n={n_event_all})"]
+    header = ["Variable", f"{event_outcome} (n={n_event_all})", f"{baseline_outcome} (n={n_baseline_all})"]
     if compute_or:
         header.append(f"OR ({ci_pct}% CI)")
     if compute_rr:
@@ -303,7 +303,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             else:
                 pct_d = 100 * d / base_total_var if base_total_var else 0.0
                 pct_c = 100 * c / event_total_var if event_total_var else 0.0
-            ref_cells = [f"{d} ({pct_d:.{pct_digits}f}%)", f"{c} ({pct_c:.{pct_digits}f}%)"]
+            ref_cells = [f"{c} ({pct_c:.{pct_digits}f}%)", f"{d} ({pct_d:.{pct_digits}f}%)"]
             if compute_or:
                 ref_cells.append("1.00 (Reference)")
             if compute_rr:
@@ -325,7 +325,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                 else:
                     pct_b = 100 * b / base_total_var if base_total_var else 0.0
                     pct_a = 100 * a / event_total_var if event_total_var else 0.0
-                cells = [f"{b} ({pct_b:.{pct_digits}f}%)", f"{a} ({pct_a:.{pct_digits}f}%)"]
+                cells = [f"{a} ({pct_a:.{pct_digits}f}%)", f"{b} ({pct_b:.{pct_digits}f}%)"]
                 p_val = None
                 if (a + b) == 0 or (c + d) == 0:
                     if compute_or:
@@ -371,7 +371,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             label = numeric_label(col, display_mode, use_param)
             cell_baseline = format_numeric_cell(baseline_vals, display_mode, use_param, desc_decimals)
             cell_event = format_numeric_cell(event_vals, display_mode, use_param, desc_decimals)
-            cells = [cell_baseline, cell_event]
+            cells = [cell_event, cell_baseline]
 
             mask = numeric_series.notna() & y_full.notna()
             xv = numeric_series[mask].values
