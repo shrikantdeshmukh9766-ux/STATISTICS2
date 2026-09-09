@@ -270,7 +270,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
         header.append(f"OR ({ci_pct}% CI)")
     if compute_rr:
         header.append(f"RR ({ci_pct}% CI)")
-    header.append("p")
+    header.append("p-value")
 
     csv_rows = [header]
     display_rows = []
