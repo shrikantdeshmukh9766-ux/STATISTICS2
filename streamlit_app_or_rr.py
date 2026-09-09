@@ -248,11 +248,115 @@ def poisson_rr(x, y, alpha, standardize=False):
 
 
 # --------------------------------------------------------------------------
+# Multivariable (adjusted OR / RR) design + models
+# --------------------------------------------------------------------------
+
+def build_multivariate_design(df, numeric_factors, categorical_factors, ref_map, numeric_effect):
+    """Builds a design matrix for a multivariable model: numeric factors as
+    continuous columns (optionally standardized), categorical factors as
+    reference-coded dummy columns. Returns (X_df, col_meta) where col_meta
+    maps design-column-name -> (original_col, level_or_None)."""
+    cols_data = {}
+    col_meta = {}
+    for col in numeric_factors:
+        s = pd.to_numeric(df[col], errors="coerce")
+        if numeric_effect == "sd":
+            sd = s.std(ddof=1)
+            if sd and sd > 0:
+                s = (s - s.mean()) / sd
+        cols_data[col] = s
+        col_meta[col] = (col, None)
+    for col in categorical_factors:
+        series = df[col].astype(str).str.strip()
+        series = series.where(df[col].notna() & (series != ""), other=np.nan)
+        ref = ref_map.get(col)
+        levels = sorted(series.dropna().unique().tolist())
+        if ref not in levels:
+            continue
+        for lv in levels:
+            if lv == ref:
+                continue
+            dname = f"{col}::{lv}"
+            dummy = (series == lv).astype(float)
+            dummy = dummy.where(series.notna(), other=np.nan)
+            cols_data[dname] = dummy
+            col_meta[dname] = (col, lv)
+    X_df = pd.DataFrame(cols_data, index=df.index)
+    return X_df, col_meta
+
+
+def multivariate_logistic(X_df, y_full, alpha):
+    """Adjusted OR for every column of X_df, from one multivariable logistic
+    regression (complete-case: rows with any missing predictor or outcome
+    are dropped). Returns (results_dict, n_used, error_message)."""
+    if sm is None:
+        return None, 0, "statsmodels is not installed"
+    if X_df.shape[1] == 0:
+        return None, 0, "no factors available"
+    mask = X_df.notna().all(axis=1) & y_full.notna()
+    Xs = X_df.loc[mask].astype(float)
+    ys = y_full.loc[mask].astype(float)
+    if ys.nunique() < 2 or len(ys) < Xs.shape[1] + 5:
+        return None, int(mask.sum()), "insufficient complete-case data for the multivariable model"
+    Xc = sm.add_constant(Xs)
+    try:
+        model = sm.Logit(ys, Xc).fit(disp=0)
+    except Exception as e:
+        return None, int(mask.sum()), str(e)
+    z = stats.norm.ppf(1 - alpha / 2)
+    results = {}
+    for col in Xs.columns:
+        coef, se, p = model.params[col], model.bse[col], model.pvalues[col]
+        results[col] = {"val": np.exp(coef), "low": np.exp(coef - z * se),
+                         "high": np.exp(coef + z * se), "p": float(p)}
+    return results, int(mask.sum()), None
+
+
+def multivariate_rr(X_df, y_full, alpha):
+    """Adjusted RR for every column of X_df, from one multivariable
+    log-binomial regression, falling back to modified Poisson regression
+    with robust (HC1) standard errors if log-binomial fails to converge.
+    Returns (results_dict, n_used, method, error_message)."""
+    if sm is None:
+        return None, 0, None, "statsmodels is not installed"
+    if X_df.shape[1] == 0:
+        return None, 0, None, "no factors available"
+    mask = X_df.notna().all(axis=1) & y_full.notna()
+    Xs = X_df.loc[mask].astype(float)
+    ys = y_full.loc[mask].astype(float)
+    if ys.nunique() < 2 or len(ys) < Xs.shape[1] + 5:
+        return None, int(mask.sum()), None, "insufficient complete-case data for the multivariable model"
+    Xc = sm.add_constant(Xs)
+    method = "log-binomial"
+    try:
+        model = sm.GLM(ys, Xc, family=sm.families.Binomial(link=sm.families.links.Log())).fit()
+    except Exception:
+        try:
+            model = sm.GLM(ys, Xc, family=sm.families.Poisson()).fit(cov_type="HC1")
+            method = "modified Poisson (robust SE)"
+        except Exception as e:
+            return None, int(mask.sum()), None, str(e)
+    z = stats.norm.ppf(1 - alpha / 2)
+    results = {}
+    for col in Xs.columns:
+        coef, se = model.params[col], model.bse[col]
+        p = float(2 * (1 - stats.norm.cdf(abs(coef / se)))) if se > 0 else float("nan")
+        results[col] = {"val": np.exp(coef), "low": np.exp(coef - z * se),
+                         "high": np.exp(coef + z * se), "p": p}
+    return results, int(mask.sum()), method, None
+
+
+# --------------------------------------------------------------------------
 # Table builder
 # --------------------------------------------------------------------------
 
+def _sig(p, alpha):
+    return p is not None and not (isinstance(p, float) and np.isnan(p)) and p < alpha
+
+
 def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_cols,
-                       factor_types, ref_map, alpha, compute_or, compute_rr, numeric_effect,
+                       factor_types, ref_map, alpha, compute_or_crude, compute_rr_crude,
+                       compute_or_adj, compute_rr_adj, numeric_effect,
                        display_mode, desc_decimals, or_decimals, pct_digits, yates_correction,
                        pct_mode="column"):
     outcome_raw = df[outcome_col].astype(str).str.strip()
@@ -266,15 +370,37 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
 
     ci_pct = int(round((1 - alpha) * 100))
     header = ["Variable", f"{event_outcome} (n={n_event_all})", f"{baseline_outcome} (n={n_baseline_all})"]
-    if compute_or:
-        header.append(f"OR ({ci_pct}% CI)")
-    if compute_rr:
-        header.append(f"RR ({ci_pct}% CI)")
-    header.append("p-value")
+    if compute_or_crude:
+        header += [f"cOR ({ci_pct}% CI)", "p-value (cOR)"]
+    if compute_rr_crude:
+        header += [f"cRR ({ci_pct}% CI)", "p-value (cRR)"]
+    if compute_or_adj:
+        header += [f"adjOR ({ci_pct}% CI)", "p-value (adjOR)"]
+    if compute_rr_adj:
+        header += [f"adjRR ({ci_pct}% CI)", "p-value (adjRR)"]
 
     csv_rows = [header]
     display_rows = []
     flags = set()
+
+    numeric_factors = [c for c in factor_cols if factor_types[c] == "numerical"]
+    categorical_factors = [c for c in factor_cols if factor_types[c] == "categorical"]
+
+    adj_or_results, adj_rr_results = None, None
+    n_adj_or = n_adj_rr = 0
+    if compute_or_adj or compute_rr_adj:
+        design_X, _col_meta = build_multivariate_design(df, numeric_factors, categorical_factors,
+                                                          ref_map, numeric_effect)
+        if compute_or_adj:
+            adj_or_results, n_adj_or, err_or = multivariate_logistic(design_X, y_full, alpha)
+            if err_or:
+                flags.add("adjor_error")
+        if compute_rr_adj:
+            adj_rr_results, n_adj_rr, method_rr, err_rr = multivariate_rr(design_X, y_full, alpha)
+            if err_rr:
+                flags.add("adjrr_error")
+            elif method_rr == "modified Poisson (robust SE)":
+                flags.add("modpoisson_adj")
 
     for col in factor_cols:
         vtype = factor_types[col]
@@ -304,12 +430,10 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                 pct_d = 100 * d / base_total_var if base_total_var else 0.0
                 pct_c = 100 * c / event_total_var if event_total_var else 0.0
             ref_cells = [f"{c} ({pct_c:.{pct_digits}f}%)", f"{d} ({pct_d:.{pct_digits}f}%)"]
-            if compute_or:
-                ref_cells.append("1.00 (Reference)")
-            if compute_rr:
-                ref_cells.append("1.00 (Reference)")
-            ref_cells.append("—")
-            display_rows.append({"kind": "level", "label": ref, "cells": ref_cells, "sig": False})
+            for flag_on in (compute_or_crude, compute_rr_crude, compute_or_adj, compute_rr_adj):
+                if flag_on:
+                    ref_cells += ["1.00 (Reference)", "—"]
+            display_rows.append({"kind": "level", "label": ref, "cells": ref_cells, "sig_idx": []})
             csv_rows.append([f"  {ref}", *ref_cells])
 
             for lv in levels:
@@ -326,36 +450,55 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                     pct_b = 100 * b / base_total_var if base_total_var else 0.0
                     pct_a = 100 * a / event_total_var if event_total_var else 0.0
                 cells = [f"{a} ({pct_a:.{pct_digits}f}%)", f"{b} ({pct_b:.{pct_digits}f}%)"]
-                p_val = None
-                if (a + b) == 0 or (c + d) == 0:
-                    if compute_or:
-                        cells.append("—")
-                    if compute_rr:
-                        cells.append("—")
-                    cells.append("—")
-                    flags.add("skipped")
-                else:
-                    test_res = chi_or_fisher_p([[a, b], [c, d]], yates_correction=yates_correction)
-                    p_val = test_res["p"]
-                    if test_res["name"].startswith("Fisher"):
-                        flags.add("fisher")
+                sig_idx = []
+
+                if compute_or_crude or compute_rr_crude:
+                    if (a + b) == 0 or (c + d) == 0:
+                        if compute_or_crude:
+                            cells += ["—", "—"]
+                        if compute_rr_crude:
+                            cells += ["—", "—"]
+                        flags.add("skipped")
                     else:
-                        flags.add("chi2")
-                        if test_res["min_expected"] < 5:
-                            flags.add("lowE")
-                    if compute_or:
-                        r = odds_ratio_ci(a, b, c, d, alpha)
-                        if r["corrected"]:
-                            flags.add("haldane")
-                        cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
-                    if compute_rr:
-                        r = relative_risk_ci(a, b, c, d, alpha)
-                        if r["corrected"]:
-                            flags.add("haldane")
-                        cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
-                    cells.append(fmt_p(p_val))
-                sig = p_val is not None and p_val < alpha
-                display_rows.append({"kind": "level", "label": lv, "cells": cells, "sig": sig})
+                        test_res = chi_or_fisher_p([[a, b], [c, d]], yates_correction=yates_correction)
+                        crude_p = test_res["p"]
+                        if test_res["name"].startswith("Fisher"):
+                            flags.add("fisher")
+                        else:
+                            flags.add("chi2")
+                            if test_res["min_expected"] < 5:
+                                flags.add("lowE")
+                        if compute_or_crude:
+                            r = odds_ratio_ci(a, b, c, d, alpha)
+                            if r["corrected"]:
+                                flags.add("haldane")
+                            cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
+                            cells.append(fmt_p(crude_p))
+                            if _sig(crude_p, alpha):
+                                sig_idx.append(len(cells) - 1)
+                        if compute_rr_crude:
+                            r = relative_risk_ci(a, b, c, d, alpha)
+                            if r["corrected"]:
+                                flags.add("haldane")
+                            cells.append(fmt_ratio(r["val"], r["low"], r["high"], or_decimals))
+                            cells.append(fmt_p(crude_p))
+                            if _sig(crude_p, alpha):
+                                sig_idx.append(len(cells) - 1)
+
+                for adj_on, results in ((compute_or_adj, adj_or_results), (compute_rr_adj, adj_rr_results)):
+                    if not adj_on:
+                        continue
+                    res = results.get(f"{col}::{lv}") if results else None
+                    if res:
+                        cells.append(fmt_ratio(res["val"], res["low"], res["high"], or_decimals))
+                        cells.append(fmt_p(res["p"]))
+                        if _sig(res["p"], alpha):
+                            sig_idx.append(len(cells) - 1)
+                    else:
+                        cells += ["—", "—"]
+                        flags.add("skipped_adj")
+
+                display_rows.append({"kind": "level", "label": lv, "cells": cells, "sig_idx": sig_idx})
                 csv_rows.append([f"  {lv}", *cells])
 
         else:  # numerical
@@ -372,53 +515,71 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             cell_baseline = format_numeric_cell(baseline_vals, display_mode, use_param, desc_decimals)
             cell_event = format_numeric_cell(event_vals, display_mode, use_param, desc_decimals)
             cells = [cell_event, cell_baseline]
+            sig_idx = []
 
             mask = numeric_series.notna() & y_full.notna()
             xv = numeric_series[mask].values
             yv = y_full[mask].values
             n = len(xv)
 
-            p_val = None
-            if n < 8 or len(np.unique(yv)) < 2:
-                if compute_or:
-                    cells.append("—")
-                if compute_rr:
-                    cells.append("—")
-                cells.append("—")
-                flags.add("skipped")
-            else:
-                if compute_or:
-                    lg = logistic_or(xv, yv, alpha, standardize=(numeric_effect == "sd"))
-                    if lg.get("error"):
-                        cells.append("—")
-                        flags.add("skipped")
-                    else:
-                        cells.append(fmt_ratio(lg["val"], lg["low"], lg["high"], or_decimals))
-                        p_val = lg["p"]
-                if compute_rr:
-                    ps = poisson_rr(xv, yv, alpha, standardize=(numeric_effect == "sd"))
-                    if ps.get("error"):
-                        cells.append("—")
-                        flags.add("skipped")
-                    else:
-                        cells.append(fmt_ratio(ps["val"], ps["low"], ps["high"], or_decimals))
-                        if p_val is None:
-                            p_val = ps["p"]
-                        if ps.get("method") == "modified Poisson (robust SE)":
-                            flags.add("modpoisson")
-                cells.append(fmt_p(p_val) if p_val is not None else "—")
-            sig = p_val is not None and p_val < alpha
-            display_rows.append({"kind": "var", "label": label, "cells": cells, "sig": sig})
+            if compute_or_crude or compute_rr_crude:
+                if n < 8 or len(np.unique(yv)) < 2:
+                    if compute_or_crude:
+                        cells += ["—", "—"]
+                    if compute_rr_crude:
+                        cells += ["—", "—"]
+                    flags.add("skipped")
+                else:
+                    if compute_or_crude:
+                        lg = logistic_or(xv, yv, alpha, standardize=(numeric_effect == "sd"))
+                        if lg.get("error"):
+                            cells += ["—", "—"]
+                            flags.add("skipped")
+                        else:
+                            cells.append(fmt_ratio(lg["val"], lg["low"], lg["high"], or_decimals))
+                            cells.append(fmt_p(lg["p"]))
+                            if _sig(lg["p"], alpha):
+                                sig_idx.append(len(cells) - 1)
+                    if compute_rr_crude:
+                        ps = poisson_rr(xv, yv, alpha, standardize=(numeric_effect == "sd"))
+                        if ps.get("error"):
+                            cells += ["—", "—"]
+                            flags.add("skipped")
+                        else:
+                            cells.append(fmt_ratio(ps["val"], ps["low"], ps["high"], or_decimals))
+                            cells.append(fmt_p(ps["p"]))
+                            if ps.get("method") == "modified Poisson (robust SE)":
+                                flags.add("modpoisson")
+                            if _sig(ps["p"], alpha):
+                                sig_idx.append(len(cells) - 1)
+
+            for adj_on, results in ((compute_or_adj, adj_or_results), (compute_rr_adj, adj_rr_results)):
+                if not adj_on:
+                    continue
+                res = results.get(col) if results else None
+                if res:
+                    cells.append(fmt_ratio(res["val"], res["low"], res["high"], or_decimals))
+                    cells.append(fmt_p(res["p"]))
+                    if _sig(res["p"], alpha):
+                        sig_idx.append(len(cells) - 1)
+                else:
+                    cells += ["—", "—"]
+                    flags.add("skipped_adj")
+
+            display_rows.append({"kind": "var", "label": label, "cells": cells, "sig_idx": sig_idx})
             csv_rows.append([label, *cells])
 
-    return header, display_rows, csv_rows, flags
+    n_adj_info = {"n_adj_or": n_adj_or, "n_adj_rr": n_adj_rr}
+    return header, display_rows, csv_rows, flags, n_adj_info
 
 
 def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, n_excluded,
-                     yates_correction, compute_or, compute_rr, display_mode, desc_decimals,
-                     or_decimals, numeric_effect, pct_digits, pct_mode="column"):
+                     yates_correction, compute_or_crude, compute_rr_crude, compute_or_adj,
+                     compute_rr_adj, display_mode, desc_decimals, or_decimals, numeric_effect,
+                     pct_digits, pct_mode="column", n_adj_info=None, selected_factors=None):
     ci_pct = int(round((1 - alpha) * 100))
     notes = []
+    n_adj_info = n_adj_info or {}
 
     desc_txt = {"mean_sd": "mean \u00B1 SD", "median_iqr": "median (IQR)",
                 "both": "mean \u00B1 SD and median (IQR)",
@@ -435,10 +596,12 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, 
                   f"decimal place(s) (missing values excluded from the denominator).")
 
     parts = []
-    if compute_or:
+    if compute_or_crude or compute_or_adj:
         parts.append("OR = odds ratio")
-    if compute_rr:
+    if compute_rr_crude or compute_rr_adj:
         parts.append("RR = relative risk (risk ratio)")
+    parts.append("c- prefix = crude (univariate, unadjusted)")
+    parts.append("adj- prefix = adjusted (multivariable)")
     notes.append("; ".join(parts) + f"; CI = confidence interval ({ci_pct}%), shown to {or_decimals} "
                   f"decimal place(s).")
 
@@ -449,37 +612,66 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, 
            if n_excluded > 0 else "")
     )
 
-    cat_note = ("Categorical factors: OR/RR computed pairwise against the stated baseline category, "
-                "restricted to rows in the compared category or the reference category; p-value from "
-                "chi-square test of independence")
-    cat_note += (" (Yates' continuity correction applied to 2\u00D72 tables)" if yates_correction
-                 else " (no continuity correction applied)")
-    cat_note += ", automatically switched to Fisher's exact test when an expected cell count is below 5."
-    notes.append(cat_note)
+    if compute_or_crude or compute_rr_crude:
+        cat_note = ("Crude (cOR/cRR): categorical factors compared pairwise against the stated baseline "
+                    "category, restricted to rows in the compared category or the reference category; "
+                    "p-value from chi-square test of independence")
+        cat_note += (" (Yates' continuity correction applied to 2\u00D72 tables)" if yates_correction
+                     else " (no continuity correction applied)")
+        cat_note += ", automatically switched to Fisher's exact test when an expected cell count is below 5."
+        notes.append(cat_note)
 
     if "haldane" in flags:
         notes.append("Haldane-Anscombe correction (0.5 added to all four cell counts) applied where a "
-                      "2\u00D72 table contained a zero cell, to allow OR/RR and CI calculation.")
+                      "2\u00D72 table contained a zero cell, to allow cOR/cRR and CI calculation.")
     if "lowE" in flags:
         notes.append("Caution: one or more chi-square comparisons above have expected cell counts below "
                       "5; the chi-square approximation may be unreliable there.")
 
-    num_parts = []
     eff_txt = "per 1 SD increase" if numeric_effect == "sd" else "per 1 unit increase"
-    if compute_or:
-        num_parts.append(f"OR ({eff_txt}) from univariate logistic regression (Wald {ci_pct}% CI)")
-    if compute_rr:
-        rr_txt = f"RR ({eff_txt}) from log-binomial regression"
+    crude_num_parts = []
+    if compute_or_crude:
+        crude_num_parts.append(f"cOR ({eff_txt}) from univariate logistic regression (Wald {ci_pct}% CI)")
+    if compute_rr_crude:
+        rr_txt = f"cRR ({eff_txt}) from log-binomial regression"
         if "modpoisson" in flags:
             rr_txt += ", falling back to modified Poisson regression with robust (HC1) standard errors when log-binomial failed to converge"
-        num_parts.append(rr_txt)
-    if num_parts:
-        notes.append("Numeric factors: " + "; ".join(num_parts) + ".")
+        crude_num_parts.append(rr_txt)
+    if crude_num_parts:
+        notes.append("Numeric factors (crude): " + "; ".join(crude_num_parts) + ".")
+
+    if compute_or_adj or compute_rr_adj:
+        n_desc = []
+        if compute_or_adj:
+            n_desc.append(f"adjOR model n={n_adj_info.get('n_adj_or', 0)}")
+        if compute_rr_adj:
+            n_desc.append(f"adjRR model n={n_adj_info.get('n_adj_rr', 0)}")
+        adj_note = ("Adjusted (adjOR/adjRR): each factor's effect estimated from a single multivariable "
+                    "model that includes all selected factors simultaneously" +
+                    (f" ({', '.join(selected_factors)})" if selected_factors else "") +
+                    f"; complete-case analysis (rows missing any selected factor or the outcome are "
+                    f"dropped) — {'; '.join(n_desc)}. adjOR from multivariable logistic regression (Wald "
+                    f"{ci_pct}% CI)")
+        if compute_rr_adj:
+            adj_note += (f"; adjRR from multivariable log-binomial regression, falling back to modified "
+                        f"Poisson regression with robust (HC1) standard errors when log-binomial failed "
+                        f"to converge" if "modpoisson_adj" in flags else
+                        f"; adjRR from multivariable log-binomial regression")
+        adj_note += f". Numeric factors: {eff_txt}."
+        notes.append(adj_note)
+        if "adjor_error" in flags or "adjrr_error" in flags:
+            notes.append("The adjusted (multivariable) model could not be fit — likely too few "
+                          "complete-case observations relative to the number of factors, or a "
+                          "convergence failure. Adjusted columns for affected factors show '—'.")
+        if "skipped_adj" in flags:
+            notes.append("An adjusted estimate could not be computed for one or more "
+                          "categories/variables (e.g. zero-variance predictor in the complete-case "
+                          "subset) and was left blank.")
 
     if "skipped" in flags:
-        notes.append("A comparison could not be computed for one or more categories/variables (e.g. "
-                      "insufficient data, zero-variance predictor, or model non-convergence) and was "
-                      "left blank.")
+        notes.append("A crude comparison could not be computed for one or more categories/variables "
+                      "(e.g. insufficient data, zero-variance predictor, or model non-convergence) and "
+                      "was left blank.")
     notes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
     return notes
 
@@ -520,10 +712,9 @@ def render_table_markdown(header, display_rows):
         else:
             name_cls = "name" if row["kind"] == "level" else ""
             html += f'<td class="{name_cls}">{row["label"]}</td>'
-            n_cells = len(row["cells"])
+            sig_set = set(row.get("sig_idx", []))
             for i, c in enumerate(row["cells"]):
-                is_p = i == n_cells - 1
-                cls2 = "stat sig" if (is_p and row.get("sig")) else "stat"
+                cls2 = "stat sig" if i in sig_set else "stat"
                 html += f'<td class="{cls2}">{c}</td>'
         html += "</tr>"
     html += "</tbody></table>"
@@ -626,14 +817,14 @@ def build_docx(header, display_rows, alpha, footnotes, title="Odds Ratio / Relat
             cells[0].text = label
             for run in cells[0].paragraphs[0].runs:
                 _set_run_font(run, size=9, bold=(row["kind"] == "var"))
-            n_cells = len(row["cells"])
+            sig_set = set(row.get("sig_idx", []))
             for ci, val in enumerate(row["cells"], start=1):
                 cells[ci].text = str(val)
-                is_p = ci == n_cells
+                is_sig = (ci - 1) in sig_set
                 for p in cells[ci].paragraphs:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     for run in p.runs:
-                        _set_run_font(run, size=9, bold=(is_p and row.get("sig")))
+                        _set_run_font(run, size=9, bold=is_sig)
 
         if next_is_new_block:
             for c in cells:
@@ -816,9 +1007,32 @@ if uploaded is not None:
     st.markdown("### 4. Analysis settings")
     s1, s2, s3, s4 = st.columns([1.4, 1.4, 1.1, 1.1])
     with s1:
-        st.markdown("**Effect measure**")
-        compute_or = st.checkbox("Compute Odds Ratio (OR)", value=True)
-        compute_rr = st.checkbox("Compute Relative Risk (RR)", value=True)
+        st.markdown("**Analysis type**")
+        analysis_type = st.radio(
+            "Analysis type",
+            options=["univariate", "multivariate", "both"],
+            format_func=lambda x: {"univariate": "Univariate", "multivariate": "Multivariate",
+                                    "both": "Both"}[x],
+            label_visibility="collapsed",
+        )
+        if analysis_type == "univariate":
+            st.caption("Crude estimate: each factor analyzed on its own.")
+            compute_or_crude = st.checkbox("cOR (crude Odds Ratio)", value=True)
+            compute_rr_crude = st.checkbox("cRR (crude Relative Risk)", value=True)
+            compute_or_adj = False
+            compute_rr_adj = False
+        elif analysis_type == "multivariate":
+            st.caption("Adjusted estimate: one model with all selected factors together.")
+            compute_or_adj = st.checkbox("adjOR (adjusted Odds Ratio)", value=True)
+            compute_rr_adj = st.checkbox("adjRR (adjusted Relative Risk)", value=True)
+            compute_or_crude = False
+            compute_rr_crude = False
+        else:
+            st.caption("Shows both crude and adjusted columns for the measure(s) below.")
+            measure_or = st.checkbox("OR (odds ratio)", value=True)
+            measure_rr = st.checkbox("RR (relative risk)", value=True)
+            compute_or_crude = compute_or_adj = measure_or
+            compute_rr_crude = compute_rr_adj = measure_rr
         or_decimals = st.number_input("OR/RR decimal places", min_value=0, max_value=6, value=2, step=1)
     with s2:
         st.markdown("**Continuous descriptive stats**")
@@ -857,35 +1071,50 @@ if uploaded is not None:
     if not selected_factors:
         st.warning("No factors selected — check **Use** for at least one variable above.")
         can_generate = False
-    if not (compute_or or compute_rr):
-        st.warning("Select at least one of Odds Ratio or Relative Risk.")
+    if not (compute_or_crude or compute_rr_crude or compute_or_adj or compute_rr_adj):
+        st.warning("Select at least one effect measure to compute.")
         can_generate = False
     if numeric_factors and sm is None:
         st.warning("Numeric factors are selected but `statsmodels` isn't installed — those rows will be skipped.")
+    if (compute_or_adj or compute_rr_adj) and sm is None:
+        st.warning("Adjusted (multivariable) OR/RR require `statsmodels`, which isn't installed.")
+    if (compute_or_adj or compute_rr_adj) and len(selected_factors) > 1:
+        st.caption(f"Adjusted estimates will come from one multivariable model containing all "
+                   f"{len(selected_factors)} selected factors together (complete-case analysis).")
 
     if st.button("Generate table", type="primary", disabled=not can_generate):
-        header, display_rows, csv_rows, flags = build_split_table(
+        header, display_rows, csv_rows, flags, n_adj_info = build_split_table(
             df, outcome_col, baseline_outcome, event_outcome, selected_factors, factor_types,
-            ref_map, alpha, compute_or, compute_rr, numeric_effect, display_mode, desc_decimals,
-            or_decimals, pct_digits, yates_correction, pct_mode,
+            ref_map, alpha, compute_or_crude, compute_rr_crude, compute_or_adj, compute_rr_adj,
+            numeric_effect, display_mode, desc_decimals, or_decimals, pct_digits, yates_correction,
+            pct_mode,
         )
         st.session_state["or_rr_result"] = (header, display_rows, csv_rows, flags, alpha,
                                              outcome_col, baseline_outcome, event_outcome, n_excluded,
-                                             yates_correction, compute_or, compute_rr, display_mode,
+                                             yates_correction, compute_or_crude, compute_rr_crude,
+                                             compute_or_adj, compute_rr_adj, display_mode,
                                              desc_decimals, or_decimals, numeric_effect, pct_digits,
-                                             pct_mode)
+                                             pct_mode, n_adj_info, list(selected_factors))
 
     if "or_rr_result" in st.session_state:
         (header, display_rows, csv_rows, flags, r_alpha, r_outcome_col, r_baseline, r_event,
-         r_n_excluded, r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
-         r_or_decimals, r_numeric_effect, r_pct_digits, r_pct_mode) = st.session_state["or_rr_result"]
+         r_n_excluded, r_yates, r_compute_or_crude, r_compute_rr_crude, r_compute_or_adj,
+         r_compute_rr_adj, r_display_mode, r_desc_decimals, r_or_decimals, r_numeric_effect,
+         r_pct_digits, r_pct_mode, r_n_adj_info, r_selected_factors) = st.session_state["or_rr_result"]
 
-        st.markdown("### Table. Baseline characteristics with univariate OR / RR")
+        table_kind = []
+        if r_compute_or_crude or r_compute_rr_crude:
+            table_kind.append("crude")
+        if r_compute_or_adj or r_compute_rr_adj:
+            table_kind.append("adjusted")
+        st.markdown(f"### Table. Baseline characteristics with {' and '.join(table_kind)} OR / RR")
         st.markdown(render_table_markdown(header, display_rows), unsafe_allow_html=True)
 
         footnotes = build_footnotes(r_alpha, flags, r_outcome_col, r_baseline, r_event, r_n_excluded,
-                                     r_yates, r_compute_or, r_compute_rr, r_display_mode, r_desc_decimals,
-                                     r_or_decimals, r_numeric_effect, r_pct_digits, r_pct_mode)
+                                     r_yates, r_compute_or_crude, r_compute_rr_crude, r_compute_or_adj,
+                                     r_compute_rr_adj, r_display_mode, r_desc_decimals, r_or_decimals,
+                                     r_numeric_effect, r_pct_digits, r_pct_mode, r_n_adj_info,
+                                     r_selected_factors)
         st.caption("  \n".join(footnotes))
 
         dl_col1, dl_col2, dl_col3 = st.columns(3)
