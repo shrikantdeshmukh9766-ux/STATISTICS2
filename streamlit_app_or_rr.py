@@ -19,30 +19,47 @@ Outcome    -> pick a column, then pick which category is the "baseline"
               value are excluded from the analysis. The table has one
               column per outcome group (baseline, event).
 
+Analysis type -> Univariate (crude, cOR/cRR — each factor analyzed on its
+              own), Multivariate (adjusted, adjOR/adjRR — one model with
+              all selected factors together), or Both (shows crude and
+              adjusted side by side for the chosen measure(s)).
+
 Continuous (numeric) factors -> reported per outcome group as mean \u00B1 SD,
               median (IQR), or both — your choice, with a decimal-places
               control. "Auto" picks mean \u00B1 SD when both outcome groups
               pass a D'Agostino-Pearson normality test, median (IQR)
               otherwise.
-                OR = exp(beta) from univariate logistic regression
-                RR = exp(beta) from log-binomial regression, falling back
-                     to modified Poisson regression with robust (HC1)
-                     standard errors if log-binomial fails to converge.
+                cOR/adjOR = exp(beta) from logistic regression (single
+                     predictor for cOR, all selected factors together for
+                     adjOR).
+                cRR/adjRR = exp(beta) from the RR regression method you
+                     choose in the settings panel: Binomial with log link
+                     (log-binomial), Poisson with log link, or modified
+                     Poisson with robust (HC1) standard errors. Applied the
+                     same way regardless of analysis type.
               Effect size is reported per 1 unit or per 1 SD increase,
               your choice.
 
 Categorical factors -> reported as n (%) per outcome group (% of that
               group's non-missing total for the variable). Pick a baseline
               (reference) category; every other category is compared
-              pairwise against it using a 2x2 table:
-                OR = (a*d) / (b*c)              [Woolf logit 95% CI]
-                RR = risk(exposed) / risk(ref)   [log-method 95% CI]
-                p  = chi-square test of independence, automatically
-                     switched to Fisher's exact test when an expected
-                     cell count is below 5.
+              pairwise against it.
+                cOR = (a*d) / (b*c)              [Woolf logit 95% CI, 2x2 table]
+                cRR = risk(exposed) / risk(ref)   [log-method 95% CI, 2x2 table —
+                     always this closed-form method, independent of the RR
+                     regression method setting]
+                adjOR/adjRR = from the multivariable model (see above),
+                     one dummy variable per non-reference level.
+                p  = chi-square test of independence for cOR/cRR,
+                     automatically switched to Fisher's exact test when an
+                     expected cell count is below 5; Wald test p-value from
+                     the model for adjOR/adjRR.
               A 2x2 table with a zero cell gets the Haldane-Anscombe
-              correction (+0.5 to all four cells) so OR/RR/CI can still be
+              correction (+0.5 to all four cells) so cOR/cRR/CI can still be
               computed; this is flagged in the footnotes.
+
+Adjusted (multivariable) estimates use complete-case analysis: rows
+missing any selected factor, or the outcome, are dropped from that model.
 
 OR/RR values and descriptive statistics each have their own independent
 decimal-places control in the settings panel.
@@ -220,7 +237,28 @@ def logistic_or(x, y, alpha, standardize=False):
         return {"error": str(e)}
 
 
-def poisson_rr(x, y, alpha, standardize=False):
+RR_METHOD_LABELS = {
+    "logbinomial": "log-binomial regression (Binomial family, log link)",
+    "poisson": "Poisson regression (Poisson family, log link, model-based SE)",
+    "modpoisson": "modified Poisson regression (Poisson family, log link, robust HC1 SE)",
+}
+
+
+def _fit_rr_glm(y, X, rr_method):
+    """Fits the GLM for the chosen RR method. Returns (model, error_message)."""
+    try:
+        if rr_method == "logbinomial":
+            model = sm.GLM(y, X, family=sm.families.Binomial(link=sm.families.links.Log())).fit()
+        elif rr_method == "poisson":
+            model = sm.GLM(y, X, family=sm.families.Poisson()).fit()
+        else:  # modpoisson
+            model = sm.GLM(y, X, family=sm.families.Poisson()).fit(cov_type="HC1")
+        return model, None
+    except Exception as e:
+        return None, str(e)
+
+
+def poisson_rr(x, y, alpha, standardize=False, rr_method="logbinomial"):
     if sm is None:
         return {"error": "statsmodels is not installed"}
     x = np.asarray(x, dtype=float)
@@ -231,20 +269,13 @@ def poisson_rr(x, y, alpha, standardize=False):
             x = (x - x.mean()) / sd
     X = sm.add_constant(x)
     z = stats.norm.ppf(1 - alpha / 2)
-    method = "log-binomial"
-    try:
-        model = sm.GLM(y, X, family=sm.families.Binomial(link=sm.families.links.Log())).fit()
-        coef, se = model.params[1], model.bse[1]
-    except Exception:
-        try:
-            model = sm.GLM(y, X, family=sm.families.Poisson()).fit(cov_type="HC1")
-            coef, se = model.params[1], model.bse[1]
-            method = "modified Poisson (robust SE)"
-        except Exception as e:
-            return {"error": str(e)}
+    model, err = _fit_rr_glm(y, X, rr_method)
+    if model is None:
+        return {"error": err}
+    coef, se = model.params[1], model.bse[1]
     p = float(2 * (1 - stats.norm.cdf(abs(coef / se)))) if se > 0 else float("nan")
     return {"val": np.exp(coef), "low": np.exp(coef - z * se),
-            "high": np.exp(coef + z * se), "p": p, "method": method, "error": None}
+            "high": np.exp(coef + z * se), "p": p, "method": rr_method, "error": None}
 
 
 # --------------------------------------------------------------------------
@@ -312,11 +343,10 @@ def multivariate_logistic(X_df, y_full, alpha):
     return results, int(mask.sum()), None
 
 
-def multivariate_rr(X_df, y_full, alpha):
-    """Adjusted RR for every column of X_df, from one multivariable
-    log-binomial regression, falling back to modified Poisson regression
-    with robust (HC1) standard errors if log-binomial fails to converge.
-    Returns (results_dict, n_used, method, error_message)."""
+def multivariate_rr(X_df, y_full, alpha, rr_method="logbinomial"):
+    """Adjusted RR for every column of X_df, from one multivariable GLM
+    using the chosen method (log-binomial / Poisson / modified Poisson with
+    robust SE). Returns (results_dict, n_used, method, error_message)."""
     if sm is None:
         return None, 0, None, "statsmodels is not installed"
     if X_df.shape[1] == 0:
@@ -327,15 +357,9 @@ def multivariate_rr(X_df, y_full, alpha):
     if ys.nunique() < 2 or len(ys) < Xs.shape[1] + 5:
         return None, int(mask.sum()), None, "insufficient complete-case data for the multivariable model"
     Xc = sm.add_constant(Xs)
-    method = "log-binomial"
-    try:
-        model = sm.GLM(ys, Xc, family=sm.families.Binomial(link=sm.families.links.Log())).fit()
-    except Exception:
-        try:
-            model = sm.GLM(ys, Xc, family=sm.families.Poisson()).fit(cov_type="HC1")
-            method = "modified Poisson (robust SE)"
-        except Exception as e:
-            return None, int(mask.sum()), None, str(e)
+    model, err = _fit_rr_glm(ys, Xc, rr_method)
+    if model is None:
+        return None, int(mask.sum()), None, err
     z = stats.norm.ppf(1 - alpha / 2)
     results = {}
     for col in Xs.columns:
@@ -343,7 +367,7 @@ def multivariate_rr(X_df, y_full, alpha):
         p = float(2 * (1 - stats.norm.cdf(abs(coef / se)))) if se > 0 else float("nan")
         results[col] = {"val": np.exp(coef), "low": np.exp(coef - z * se),
                          "high": np.exp(coef + z * se), "p": p}
-    return results, int(mask.sum()), method, None
+    return results, int(mask.sum()), rr_method, None
 
 
 # --------------------------------------------------------------------------
@@ -358,7 +382,7 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                        factor_types, ref_map, alpha, compute_or_crude, compute_rr_crude,
                        compute_or_adj, compute_rr_adj, numeric_effect,
                        display_mode, desc_decimals, or_decimals, pct_digits, yates_correction,
-                       pct_mode="column"):
+                       pct_mode="column", rr_method="logbinomial"):
     outcome_raw = df[outcome_col].astype(str).str.strip()
     in_scope = outcome_raw.isin([baseline_outcome, event_outcome])
     y_full = pd.Series(np.nan, index=df.index)
@@ -396,11 +420,10 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
             if err_or:
                 flags.add("adjor_error")
         if compute_rr_adj:
-            adj_rr_results, n_adj_rr, method_rr, err_rr = multivariate_rr(design_X, y_full, alpha)
+            adj_rr_results, n_adj_rr, method_rr, err_rr = multivariate_rr(design_X, y_full, alpha,
+                                                                           rr_method=rr_method)
             if err_rr:
                 flags.add("adjrr_error")
-            elif method_rr == "modified Poisson (robust SE)":
-                flags.add("modpoisson_adj")
 
     for col in factor_cols:
         vtype = factor_types[col]
@@ -541,15 +564,14 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
                             if _sig(lg["p"], alpha):
                                 sig_idx.append(len(cells) - 1)
                     if compute_rr_crude:
-                        ps = poisson_rr(xv, yv, alpha, standardize=(numeric_effect == "sd"))
+                        ps = poisson_rr(xv, yv, alpha, standardize=(numeric_effect == "sd"),
+                                         rr_method=rr_method)
                         if ps.get("error"):
                             cells += ["—", "—"]
                             flags.add("skipped")
                         else:
                             cells.append(fmt_ratio(ps["val"], ps["low"], ps["high"], or_decimals))
                             cells.append(fmt_p(ps["p"]))
-                            if ps.get("method") == "modified Poisson (robust SE)":
-                                flags.add("modpoisson")
                             if _sig(ps["p"], alpha):
                                 sig_idx.append(len(cells) - 1)
 
@@ -576,7 +598,8 @@ def build_split_table(df, outcome_col, baseline_outcome, event_outcome, factor_c
 def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, n_excluded,
                      yates_correction, compute_or_crude, compute_rr_crude, compute_or_adj,
                      compute_rr_adj, display_mode, desc_decimals, or_decimals, numeric_effect,
-                     pct_digits, pct_mode="column", n_adj_info=None, selected_factors=None):
+                     pct_digits, pct_mode="column", n_adj_info=None, selected_factors=None,
+                     rr_method="logbinomial"):
     ci_pct = int(round((1 - alpha) * 100))
     notes = []
     n_adj_info = n_adj_info or {}
@@ -629,16 +652,18 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, 
                       "5; the chi-square approximation may be unreliable there.")
 
     eff_txt = "per 1 SD increase" if numeric_effect == "sd" else "per 1 unit increase"
+    rr_method_label = RR_METHOD_LABELS.get(rr_method, rr_method)
     crude_num_parts = []
     if compute_or_crude:
         crude_num_parts.append(f"cOR ({eff_txt}) from univariate logistic regression (Wald {ci_pct}% CI)")
     if compute_rr_crude:
-        rr_txt = f"cRR ({eff_txt}) from log-binomial regression"
-        if "modpoisson" in flags:
-            rr_txt += ", falling back to modified Poisson regression with robust (HC1) standard errors when log-binomial failed to converge"
-        crude_num_parts.append(rr_txt)
+        crude_num_parts.append(f"cRR ({eff_txt}) from univariate {rr_method_label} (Wald {ci_pct}% CI)")
     if crude_num_parts:
         notes.append("Numeric factors (crude): " + "; ".join(crude_num_parts) + ".")
+    if compute_rr_crude:
+        notes.append("Crude RR for categorical factors uses the closed-form 2\u00D72 method (risk ratio "
+                      "with log-method CI), independent of the RR regression method setting; crude RR "
+                      f"for numeric factors uses {rr_method_label}.")
 
     if compute_or_adj or compute_rr_adj:
         n_desc = []
@@ -653,16 +678,15 @@ def build_footnotes(alpha, flags, outcome_col, baseline_outcome, event_outcome, 
                     f"dropped) — {'; '.join(n_desc)}. adjOR from multivariable logistic regression (Wald "
                     f"{ci_pct}% CI)")
         if compute_rr_adj:
-            adj_note += (f"; adjRR from multivariable log-binomial regression, falling back to modified "
-                        f"Poisson regression with robust (HC1) standard errors when log-binomial failed "
-                        f"to converge" if "modpoisson_adj" in flags else
-                        f"; adjRR from multivariable log-binomial regression")
+            adj_note += f"; adjRR from multivariable {rr_method_label}"
         adj_note += f". Numeric factors: {eff_txt}."
         notes.append(adj_note)
         if "adjor_error" in flags or "adjrr_error" in flags:
             notes.append("The adjusted (multivariable) model could not be fit — likely too few "
-                          "complete-case observations relative to the number of factors, or a "
-                          "convergence failure. Adjusted columns for affected factors show '—'.")
+                          "complete-case observations relative to the number of factors, a "
+                          "convergence failure, or (for log-binomial/Poisson) fitted probabilities "
+                          "outside a valid range. Adjusted columns for affected factors show '—'; try "
+                          "a different RR regression method or fewer factors.")
         if "skipped_adj" in flags:
             notes.append("An adjusted estimate could not be computed for one or more "
                           "categories/variables (e.g. zero-variance predictor in the complete-case "
@@ -1034,6 +1058,22 @@ if uploaded is not None:
             compute_or_crude = compute_or_adj = measure_or
             compute_rr_crude = compute_rr_adj = measure_rr
         or_decimals = st.number_input("OR/RR decimal places", min_value=0, max_value=6, value=2, step=1)
+        if compute_rr_crude or compute_rr_adj:
+            rr_method = st.selectbox(
+                "RR regression method",
+                options=["logbinomial", "poisson", "modpoisson"],
+                format_func=lambda x: {"logbinomial": "Binomial, log link (log-binomial)",
+                                        "poisson": "Poisson, log link",
+                                        "modpoisson": "Modified Poisson, log link (robust SE)"}[x],
+                help="Applies to every RR estimate that comes from a regression model: crude RR for "
+                     "numeric factors, and all adjusted (adjRR) estimates. Crude RR for categorical "
+                     "factors always uses the closed-form 2\u00D72 method regardless of this setting. "
+                     "Log-binomial can fail to converge on some data; Poisson (log link) uses "
+                     "model-based SEs; modified Poisson uses robust (HC1) SEs and is the usual fallback "
+                     "when log-binomial doesn't converge.",
+            )
+        else:
+            rr_method = "logbinomial"
     with s2:
         st.markdown("**Continuous descriptive stats**")
         display_mode = st.radio(
@@ -1087,20 +1127,21 @@ if uploaded is not None:
             df, outcome_col, baseline_outcome, event_outcome, selected_factors, factor_types,
             ref_map, alpha, compute_or_crude, compute_rr_crude, compute_or_adj, compute_rr_adj,
             numeric_effect, display_mode, desc_decimals, or_decimals, pct_digits, yates_correction,
-            pct_mode,
+            pct_mode, rr_method,
         )
         st.session_state["or_rr_result"] = (header, display_rows, csv_rows, flags, alpha,
                                              outcome_col, baseline_outcome, event_outcome, n_excluded,
                                              yates_correction, compute_or_crude, compute_rr_crude,
                                              compute_or_adj, compute_rr_adj, display_mode,
                                              desc_decimals, or_decimals, numeric_effect, pct_digits,
-                                             pct_mode, n_adj_info, list(selected_factors))
+                                             pct_mode, n_adj_info, list(selected_factors), rr_method)
 
     if "or_rr_result" in st.session_state:
         (header, display_rows, csv_rows, flags, r_alpha, r_outcome_col, r_baseline, r_event,
          r_n_excluded, r_yates, r_compute_or_crude, r_compute_rr_crude, r_compute_or_adj,
          r_compute_rr_adj, r_display_mode, r_desc_decimals, r_or_decimals, r_numeric_effect,
-         r_pct_digits, r_pct_mode, r_n_adj_info, r_selected_factors) = st.session_state["or_rr_result"]
+         r_pct_digits, r_pct_mode, r_n_adj_info, r_selected_factors,
+         r_rr_method) = st.session_state["or_rr_result"]
 
         table_kind = []
         if r_compute_or_crude or r_compute_rr_crude:
@@ -1114,7 +1155,7 @@ if uploaded is not None:
                                      r_yates, r_compute_or_crude, r_compute_rr_crude, r_compute_or_adj,
                                      r_compute_rr_adj, r_display_mode, r_desc_decimals, r_or_decimals,
                                      r_numeric_effect, r_pct_digits, r_pct_mode, r_n_adj_info,
-                                     r_selected_factors)
+                                     r_selected_factors, r_rr_method)
         st.caption("  \n".join(footnotes))
 
         dl_col1, dl_col2, dl_col3 = st.columns(3)
